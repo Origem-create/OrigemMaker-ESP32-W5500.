@@ -1,0 +1,126 @@
+
+name: Compilar ESP32 W5500 WiFi para RJ45
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Obter codigo-fonte oficial
+        run: |
+          git clone https://github.com/espressif/esp-iot-bridge.git esp-iot-bridge
+          git -C esp-iot-bridge checkout b714bacf30ace2a5d48dd17571a5331ee2fc6d23
+
+      - name: Configurar Wi-Fi como entrada e W5500 como saida Ethernet
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          root = Path('esp-iot-bridge')
+          proj = root / 'examples/wifi_router'
+          cfg = proj / 'sdkconfig.defaults'
+          cfg_esp32 = proj / 'sdkconfig.defaults.esp32'
+          eth = root / 'components/iot_bridge/src/bridge_eth.c'
+          kconfig = root / 'components/iot_bridge/Kconfig'
+          assert cfg.is_file() and cfg_esp32.is_file()
+          assert 'esp_spi_eth_new_w5500' in eth.read_text()
+          assert 'config BRIDGE_DATA_FORWARDING_NETIF_ETHERNET' in kconfig.read_text()
+
+          settings = {
+              'CONFIG_BRIDGE_ENABLE': 'y',
+              'CONFIG_BRIDGE_ETHERNET_NETIF_ENABLE': 'y',
+              'CONFIG_BRIDGE_EXTERNAL_NETIF_STATION': 'y',
+              'CONFIG_BRIDGE_EXTERNAL_NETIF_ETHERNET': 'n',
+              'CONFIG_BRIDGE_NETIF_ETHERNET_AUTO_WAN_OR_LAN': 'n',
+              'CONFIG_BRIDGE_DATA_FORWARDING_NETIF_SOFTAP': 'n',
+              'CONFIG_BRIDGE_DATA_FORWARDING_NETIF_ETHERNET': 'y',
+              'CONFIG_BRIDGE_USE_INTERNAL_ETHERNET': 'n',
+              'CONFIG_BRIDGE_USE_SPI_ETHERNET': 'y',
+              'CONFIG_ETH_SPI_ETHERNET_W5500': 'y',
+              'CONFIG_ETH_SPI_ETHERNET_DM9051': 'n',
+              'CONFIG_ETH_SPI_ETHERNET_KSZ8851SNL': 'n',
+              'CONFIG_BRIDGE_ETH_SPI_HOST': '1',
+              'CONFIG_BRIDGE_ETH_SPI_SCLK_GPIO': '18',
+              'CONFIG_BRIDGE_ETH_SPI_MOSI_GPIO': '23',
+              'CONFIG_BRIDGE_ETH_SPI_MISO_GPIO': '19',
+              'CONFIG_BRIDGE_ETH_SPI_CS0_GPIO': '5',
+              'CONFIG_BRIDGE_ETH_SPI_INT0_GPIO': '27',
+              'CONFIG_BRIDGE_ETH_SPI_PHY_RST0_GPIO': '-1',
+              'CONFIG_BRIDGE_ETH_SPI_PHY_ADDR0': '1',
+              'CONFIG_BRIDGE_ETH_SPI_CLOCK_MHZ': '12',
+              'CONFIG_LWIP_IP_FORWARD': 'y',
+              'CONFIG_LWIP_IPV4_NAPT': 'y',
+              'CONFIG_ETHERNET_DEFAULT_EVENT_HANDLER': 'n',
+              'CONFIG_APP_BRIDGE_USE_WEB_SERVER': 'y',
+              'CONFIG_APP_BRIDGE_USE_WIFI_PROVISIONING_OVER_BLE': 'n',
+              'CONFIG_BT_ENABLED': 'n',
+              'CONFIG_BT_NIMBLE_ENABLED': 'n',
+          }
+
+          def set_config(path, edits):
+              keep = []
+              pat = re.compile(r'^(?:# )?(CONFIG_[A-Z0-9_]+)(?:=.+| is not set)$')
+              for line in path.read_text().splitlines():
+                  match = pat.match(line)
+                  if not (match and match.group(1) in edits):
+                      keep.append(line)
+              for key, value in edits.items():
+                  keep.append(f'{key}={value}' if value != 'n' else f'# {key} is not set')
+              path.write_text('\n'.join(keep) + '\n')
+
+          set_config(cfg, settings)
+          set_config(cfg_esp32, {
+              'CONFIG_APP_BRIDGE_USE_WIFI_PROVISIONING_OVER_BLE': 'n',
+              'CONFIG_BT_ENABLED': 'n',
+              'CONFIG_BT_NIMBLE_ENABLED': 'n',
+          })
+          print('GPIOs SCLK=18 MOSI=23 MISO=19 CS=5 INT=27 RST=-1')
+          print('Topologia: Wi-Fi STA -> NAT -> W5500 Ethernet -> TP-Link WAN')
+          PY
+
+      - name: Compilar firmware ESP32 com ESP-IDF 5.4.4
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.4.4
+          target: esp32
+          path: esp-iot-bridge/examples/wifi_router
+
+      - name: Unificar os binarios em imagem gravavel
+        shell: bash
+        run: |
+          python3 -m venv .flash-tools
+          .flash-tools/bin/python -m pip install 'esptool>=4.9,<5'
+          .flash-tools/bin/python - <<'PY'
+          import json, subprocess, sys
+          from pathlib import Path
+          build = Path('esp-iot-bridge/examples/wifi_router/build')
+          flasher = build / 'flasher_args.json'
+          assert flasher.is_file(), 'Compilacao nao produziu flasher_args.json'
+          data = json.loads(flasher.read_text())
+          out = build / 'OrigemMaker_ESP32_W5500_WIFI_RJ45.bin'
+          opts = data['flash_settings']
+          cmd = [sys.executable, '-m', 'esptool', '--chip', 'esp32', 'merge_bin', '-o', str(out),
+                 '--flash_mode', opts.get('flash_mode','dio'),
+                 '--flash_freq', opts.get('flash_freq','40m'),
+                 '--flash_size', opts.get('flash_size','4MB')]
+          for off, filename in sorted(data['flash_files'].items(), key=lambda pair: int(pair[0], 0)):
+              path = build / filename
+              assert path.is_file(), f'Arquivo ausente: {path}'
+              cmd += [off, str(path)]
+          subprocess.run(cmd, check=True)
+          print('Binario para gravacao em 0x0000:', out)
+          PY
+
+      - name: Disponibilizar firmware para baixar
+        uses: actions/upload-artifact@v4
+        with:
+          name: OrigemMaker-ESP32-W5500-RJ45
+          path: |
+            esp-iot-bridge/examples/wifi_router/build/OrigemMaker_ESP32_W5500_WIFI_RJ45.bin
+            esp-iot-bridge/examples/wifi_router/build/flasher_args.json
+          if-no-files-found: error
