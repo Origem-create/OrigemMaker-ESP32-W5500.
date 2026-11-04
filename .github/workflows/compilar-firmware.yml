@@ -8,6 +8,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+
     steps:
       - name: Obter codigo-fonte oficial
         run: |
@@ -27,6 +28,7 @@ jobs:
           cfg_esp32 = proj / 'sdkconfig.defaults.esp32'
           eth = root / 'components/iot_bridge/src/bridge_eth.c'
           kconfig = root / 'components/iot_bridge/Kconfig'
+
           assert cfg.is_file() and cfg_esp32.is_file()
           assert 'esp_spi_eth_new_w5500' in eth.read_text()
           assert 'config BRIDGE_DATA_FORWARDING_NETIF_ETHERNET' in kconfig.read_text()
@@ -64,21 +66,31 @@ jobs:
 
           def set_config(path, edits):
               keep = []
-              pat = re.compile(r'^(?:# )?(CONFIG_[A-Z0-9_]+)(?:=.+| is not set)$')
+              pat = re.compile(
+                  r'^(?:# )?(CONFIG_[A-Z0-9_]+)(?:=.+| is not set)$'
+              )
+
               for line in path.read_text().splitlines():
                   match = pat.match(line)
                   if not (match and match.group(1) in edits):
                       keep.append(line)
+
               for key, value in edits.items():
-                  keep.append(f'{key}={value}' if value != 'n' else f'# {key} is not set')
+                  if value == 'n':
+                      keep.append(f'# {key} is not set')
+                  else:
+                      keep.append(f'{key}={value}')
+
               path.write_text('\n'.join(keep) + '\n')
 
           set_config(cfg, settings)
+
           set_config(cfg_esp32, {
               'CONFIG_APP_BRIDGE_USE_WIFI_PROVISIONING_OVER_BLE': 'n',
               'CONFIG_BT_ENABLED': 'n',
               'CONFIG_BT_NIMBLE_ENABLED': 'n',
           })
+
           print('GPIOs SCLK=18 MOSI=23 MISO=19 CS=5 INT=27 RST=-1')
           print('Topologia: Wi-Fi STA -> NAT -> W5500 Ethernet -> TP-Link WAN')
           PY
@@ -95,25 +107,51 @@ jobs:
         run: |
           python3 -m venv .flash-tools
           .flash-tools/bin/python -m pip install 'esptool>=4.9,<5'
+
           .flash-tools/bin/python - <<'PY'
-          import json, subprocess, sys
+          import json
+          import subprocess
+          import sys
           from pathlib import Path
+
           build = Path('esp-iot-bridge/examples/wifi_router/build')
           flasher = build / 'flasher_args.json'
+
           assert flasher.is_file(), 'Compilacao nao produziu flasher_args.json'
+
           data = json.loads(flasher.read_text())
-          out = build / 'OrigemMaker_ESP32_W5500_WIFI_RJ45.bin'
+
+          # Salvar no diretorio de trabalho do GitHub Actions
+          out = Path('OrigemMaker_ESP32_W5500_WIFI_RJ45.bin')
+
           opts = data['flash_settings']
-          cmd = [sys.executable, '-m', 'esptool', '--chip', 'esp32', 'merge_bin', '-o', str(out),
-                 '--flash_mode', opts.get('flash_mode','dio'),
-                 '--flash_freq', opts.get('flash_freq','40m'),
-                 '--flash_size', opts.get('flash_size','4MB')]
-          for off, filename in sorted(data['flash_files'].items(), key=lambda pair: int(pair[0], 0)):
-              path = build / filename
-              assert path.is_file(), f'Arquivo ausente: {path}'
-              cmd += [off, str(path)]
+
+          cmd = [
+              sys.executable,
+              '-m', 'esptool',
+              '--chip', 'esp32',
+              'merge_bin',
+              '-o', str(out),
+              '--flash_mode', opts.get('flash_mode', 'dio'),
+              '--flash_freq', opts.get('flash_freq', '40m'),
+              '--flash_size', opts.get('flash_size', '4MB')
+          ]
+
+          for off, filename in sorted(
+              data['flash_files'].items(),
+              key=lambda pair: int(pair[0], 0)
+          ):
+              file_path = build / filename
+              assert file_path.is_file(), f'Arquivo ausente: {file_path}'
+              cmd += [off, str(file_path)]
+
           subprocess.run(cmd, check=True)
-          print('Binario para gravacao em 0x0000:', out)
+
+          assert out.is_file(), 'O firmware final nao foi gerado'
+
+          print('Firmware gerado:', out)
+          print('Tamanho:', out.stat().st_size, 'bytes')
+          print('Endereco para gravacao: 0x0000')
           PY
 
       - name: Disponibilizar firmware para baixar
@@ -121,6 +159,7 @@ jobs:
         with:
           name: OrigemMaker-ESP32-W5500-RJ45
           path: |
-            esp-iot-bridge/examples/wifi_router/build/OrigemMaker_ESP32_W5500_WIFI_RJ45.bin
+            OrigemMaker_ESP32_W5500_WIFI_RJ45.bin
             esp-iot-bridge/examples/wifi_router/build/flasher_args.json
           if-no-files-found: error
+          retention-days: 30
